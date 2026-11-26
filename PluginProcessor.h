@@ -1,41 +1,17 @@
 #pragma once
 #include <JuceHeader.h>
+#include "Source/WordModels.h"
+#include "Source/AudioTimeline.h"
+#include "Source/PitchShifter.h"
+#include "Source/VocalTranscriber.h"
+#include <atomic>
+#include <vector>
 
-struct WordEffectSettings {
-    // Doubler
-    bool doublerActive = false;
-    float doublerAmount = 0.7f;
-    float doublerDelayMs = 10.0f;
-    float doublerDetuneCents = 16.0f;
-
-    // Delay
-    bool delayActive = false;
-    float delayAmount = 0.55f;
-    float delayTimeMs = 345.0f;
-    float delayFeedback = 0.60f;
-    bool pingPong = true;
-
-    // Reverb
-    bool reverbActive = false;
-    float reverbAmount = 0.40f;
-    float reverbDecaySec = 3.8f;
-    float reverbWidth = 0.60f;
-
-    // Distortion
-    bool distortionActive = false;
-    float drive = 0.0f;
-
-    // Pitch / Harmony
-    bool pitchActive = false;
-    int semitoneShift = 0;
-};
-
-struct LyricWord {
-    juce::String word;
+struct PreverbSlice {
     int64_t startSample = 0;
     int64_t endSample = 0;
-    bool isSelected = false;
-    WordEffectSettings fx;
+    float amount = 0.55f;
+    juce::AudioBuffer<float> stereoAudio;
 };
 
 class LyricMomentsProcessor : public juce::AudioProcessor {
@@ -63,11 +39,61 @@ public:
     void getStateInformation(juce::MemoryBlock& destData) override;
     void setStateInformation(const void* data, int sizeInBytes) override;
 
-    // Transcribed lyrics storage
-    std::vector<LyricWord> words;
-    bool muteDry = false;
+    // Thread-safe lyric & FX word accessors
+    std::vector<LyricWord> getWordsCopy() const;
+    void setWords(std::vector<LyricWord> newWords);
+    int getWordCount() const;
+    void updateWordFxByIndex(int index, const WordEffectSettings& fx);
+    void setWordSelection(int index, bool selected);
+    void selectWordRange(int fromIndex, int toIndex);
+    void clearAllSelections();
+    void updateSearchHighlights(const juce::String& query);
+
+    // Pre-renders reverse-reverb preverb slices from AudioTimeline
+    void rebuildPreverbCache();
+
+    // Audio timeline & standalone transport controls
+    AudioTimeline& getTimeline() noexcept { return timeline; }
+    const AudioTimeline& getTimeline() const noexcept { return timeline; }
+
+    void setMuteDry(bool shouldMute) noexcept { muteDry.store(shouldMute, std::memory_order_relaxed); }
+    bool getMuteDry() const noexcept { return muteDry.load(std::memory_order_relaxed); }
+
+    void setStandalonePlaying(bool shouldPlay);
+    bool isStandalonePlaying() const noexcept { return standalonePlaying.load(std::memory_order_relaxed); }
+    void setStandaloneLoop(bool shouldLoop) noexcept { standaloneLoop.store(shouldLoop, std::memory_order_relaxed); }
+    bool isStandaloneLoop() const noexcept { return standaloneLoop.load(std::memory_order_relaxed); }
+    void seekStandaloneSample(int64_t samplePos) noexcept { standalonePlayheadSample.store(juce::jmax<int64_t>(0, samplePos), std::memory_order_relaxed); }
+
+    int64_t getCurrentPlayheadSample() const noexcept { return lastPlayheadSample.load(std::memory_order_relaxed); }
+    bool isTransportPlaying() const noexcept { return lastIsPlaying.load(std::memory_order_relaxed); }
+    int getActiveWordIndex() const noexcept { return activeWordIndex.load(std::memory_order_relaxed); }
+    double getCurrentSampleRate() const noexcept { return currentSampleRate; }
+
+    // Async transcription status shared with editor
+    void setLastTranscriptionStatus(const juce::String& status);
+    juce::String getLastTranscriptionStatus() const;
 
 private:
+    AudioTimeline timeline;
+
+    mutable juce::SpinLock wordsLock;
+    std::vector<LyricWord> words;
+
+    mutable juce::SpinLock preverbLock;
+    std::vector<PreverbSlice> preverbSlices;
+
+    mutable juce::SpinLock statusLock;
+    juce::String lastTranscriptionStatus { "Play DAW audio or load a vocal file, then click Transcribe." };
+
+    std::atomic<bool> muteDry { false };
+    std::atomic<bool> standalonePlaying { false };
+    std::atomic<bool> standaloneLoop { true };
+    std::atomic<int64_t> standalonePlayheadSample { 0 };
+    std::atomic<int64_t> lastPlayheadSample { 0 };
+    std::atomic<bool> lastIsPlaying { false };
+    std::atomic<int> activeWordIndex { -1 };
+
     double currentSampleRate = 44100.0;
 
     // DSP Engines
@@ -75,15 +101,35 @@ private:
     juce::dsp::Reverb::Parameters reverbParams;
     juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> delayL { 192000 };
     juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> delayR { 192000 };
-    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> doublerL { 48000 };
-    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> doublerR { 48000 };
-    juce::dsp::WaveShaper<float> distortion;
+    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Lagrange3rd> doublerL { 48000 };
+    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Lagrange3rd> doublerR { 48000 };
 
-    // Smoothers to avoid audio clicks when words trigger FX
+    StereoPitchShifter mainPitchShifter;
+    StereoPitchShifter harmonyShifter1;
+    StereoPitchShifter harmonyShifter2;
+
+    // Distortion 1-pole tone filter states
+    float distLpL = 0.0f;
+    float distLpR = 0.0f;
+
+    // Doubler modulation LFO phase
+    double doublerLfoPhase = 0.0;
+
+    // Latched tail settings so delay/reverb tails decay naturally after word ends
+    WordEffectSettings latchedDelay;
+    WordEffectSettings latchedReverb;
+    WordEffectSettings latchedDistortion;
+    WordEffectSettings latchedHarmony;
+    WordEffectSettings latchedPitch;
+
+    // Smoothers
     juce::SmoothedValue<float> doublerSendGain { 0.0f };
     juce::SmoothedValue<float> delaySendGain   { 0.0f };
     juce::SmoothedValue<float> reverbSendGain  { 0.0f };
     juce::SmoothedValue<float> distSendGain    { 0.0f };
+    juce::SmoothedValue<float> harmonySendGain { 0.0f };
+    juce::SmoothedValue<float> pitchSendGain   { 0.0f };
+    juce::SmoothedValue<float> smoothedDelaySamples { 15214.5f };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(LyricMomentsProcessor)
 };

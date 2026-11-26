@@ -1,0 +1,9 @@
+build/
+build-*/
+dist/
+out/
+.vs/
+*.user
+*.sln
+*.vcxproj*
+.DS_Store
